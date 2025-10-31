@@ -1,0 +1,42 @@
+name: Vercel Detach Alias
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Subdomain to detach from any alias (e.g., api.minitel.app)'
+        required: true
+        type: string
+      scope:
+        description: 'Vercel team/user scope (slug), optional'
+        required: false
+        type: string
+
+jobs:
+  detach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
+
+      - name: Detach alias
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "Missing required secret: VERCEL_TOKEN" >&2
+            exit 1
+          fi
+          SCOPE_ARG=""
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE_ARG="--scope $VERCEL_SCOPE"; fi
+          vercel alias rm "${{ inputs.domain }}" --yes --token "$VERCEL_TOKEN" $SCOPE_ARG \
+            || vercel alias remove "${{ inputs.domain }}" --yes --token "$VERCEL_TOKEN" $SCOPE_ARG \
+            || true
+          echo "Detached alias for ${{ inputs.domain }}"
